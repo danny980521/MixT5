@@ -10,6 +10,7 @@ from typing import Dict, List, Union
 import evaluate
 import numpy as np
 import torch
+from torch import nn
 from datasets import load_dataset
 from transformers import (
     AutoModelForSeq2SeqLM,
@@ -45,6 +46,10 @@ def get_args():
     train_args_group.add_argument("--gradient_checkpointing", action="store_true")
     train_args_group.add_argument("--generation_max_length", default=30, type=int)
     train_args_group.add_argument("--generation_num_beams", default=1, type=int)
+    
+    moe_args_group = parser.add_argument_group("moe")
+    moe_args_group.add_argument("enable_moe", action="store_true")
+    moe_args_group.add_argument("--reference_model_name_or_path", default="google/t5-v1_1-base", type=str)
 
     wandb_args_group = parser.add_argument_group("wandb")
     wandb_args_group.add_argument("--use_wandb", action="store_true")
@@ -143,11 +148,6 @@ def compute_metrics(eval_preds, tokenizer):
     predictions, labels = eval_preds
     predictions = np.where(predictions < 0, tokenizer.pad_token_id, predictions)
     predictions = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-    # processed_labels = []
-    # for label in labels:
-    #     label = np.where(label < 0, tokenizer.pad_token_id, label)
-    #     label = tokenizer.batch_decode(label, skip_special_tokens=True)
-    #     processed_labels.append(label)
     labels = np.where(labels < 0, tokenizer.pad_token_id, labels)
     labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
@@ -189,9 +189,20 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path)
     tokenizer.add_special_tokens({"additional_special_tokens": additional_tokens_for_task})
 
-    t5_path = "/data/dannykm/repos/SWC/software_capstone/models/t5_first/checkpoint-21900"
-    model = AutoModelForSeq2SeqLM.from_pretrained(t5_path)
-    # model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model_name_or_path)
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model_name_or_path)
+    
+    if args.enable_moe:
+        reference_path = args.reference_model_name_or_path
+        reference_model = AutoModelForSeq2SeqLM.from_pretrained(reference_path)
+        for param_name, param in model.named_parameters():
+            if "experts" in param_name:
+                reference_param_name = re.sub(r"experts\.\d+", "DenseReluDense", param_name)
+                reference_param = reference_model.get_parameter(reference_param_name)
+                param.data = reference_param.data.clone().detach()
+            elif "gate" in param_name:
+                for reference_param in nn.Linear(768, 8, bias=False).parameters():
+                    param.data = reference_param.data.clone().detach()
+    
     if tokenizer.bos_token_id is None:
         tokenizer.bos_token_id = model.config.decoder_start_token_id
         model.config.bos_token_id = tokenizer.bos_token_id
@@ -235,7 +246,6 @@ def main():
         predict_with_generate=True,
         generation_max_length=args.generation_max_length,
         generation_num_beams=args.generation_num_beams,
-        # eval_steps=1,
     )
     trainer = Seq2SeqTrainer(
         model=model,
