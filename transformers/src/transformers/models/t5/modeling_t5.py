@@ -339,6 +339,63 @@ class T5LayerFF(nn.Module):
         hidden_states = hidden_states + self.dropout(forwarded_states)
         return hidden_states
 
+class T5LayerMoeFF(nn.Module):
+    # Ref: https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py#L805-L870
+    def __init__(self, config: T5Config):
+        super().__init__()
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+        
+        self.gate = nn.Linear(config.d_model, self.num_experts, bias=False)
+        if config.is_gated_act:
+            self.experts = nn.ModuleList([T5DenseGatedActDense(config) for _ in range(self.num_experts)])
+        else:
+            self.experts = nn.ModuleList([T5DenseActDense(config) for _ in range(self.num_experts)])
+
+        # Jitter parameters
+        self.jitter_noise = config.router_jitter_noise
+
+    def forward(self, hidden_states):
+        forwarded_states = self.layer_norm(hidden_states)
+        batch_size, sequence_length, hidden_dim = forwarded_states.shape
+        forwarded_states = forwarded_states.reshape(-1, hidden_dim)
+        router_logits = self.gate(forwarded_states)
+        routing_weights = nn.functional.softmax(router_logits, dim=1)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(forwarded_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=forwarded_states.dtype, device=forwarded_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            if top_x.shape[0] == 0:
+                continue
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = forwarded_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(forwarded_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states = hidden_states + self.dropout(final_hidden_states)
+        return final_hidden_states
 
 class T5Attention(nn.Module):
     def __init__(self, config: T5Config, has_relative_attention_bias=False):
@@ -644,15 +701,19 @@ class T5LayerCrossAttention(nn.Module):
 
 
 class T5Block(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, block_idx, has_relative_attention_bias=False):
         super().__init__()
+        self.activate_moe = config.activate_moe
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
         self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
         if self.is_decoder:
             self.layer.append(T5LayerCrossAttention(config))
 
-        self.layer.append(T5LayerFF(config))
+        if self.activate_moe and config.num_moe_layers <= block_idx:
+            self.layer.append(T5LayerMoeFF(config))
+        else:
+            self.layer.append(T5LayerFF(config))
 
     def forward(
         self,
@@ -667,6 +728,7 @@ class T5Block(nn.Module):
         past_key_value=None,
         use_cache=False,
         output_attentions=False,
+        output_router_logits=False,
         return_dict=True,
     ):
         if past_key_value is not None:
@@ -763,6 +825,9 @@ class T5Block(nn.Module):
             outputs = outputs + (present_key_value_state,) + attention_outputs
         else:
             outputs = outputs + attention_outputs
+        
+        if output_router_logits:
+            outputs += (router_logits,)
 
         return outputs  # hidden-states, present_key_value_states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
 
@@ -907,7 +972,7 @@ class T5Stack(T5PreTrainedModel):
         self.is_decoder = config.is_decoder
 
         self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
+            [T5Block(config, block_idx=i, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
         )
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)

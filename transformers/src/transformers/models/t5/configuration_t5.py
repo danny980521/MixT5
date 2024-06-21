@@ -71,6 +71,18 @@ class T5Config(PretrainedConfig):
             `"gated-gelu"` feed forward projection. Original T5 uses `"relu"`.
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models).
+        activate_moe (`bool`, *optional*, defaults to `False`)
+            Whether or not use MOE layer instead of FFN layer 
+        num_experts_per_tok (`int`, *optional*, defaults to 2):
+            The number of experts to root per-token, can be also interpreted as the `top-p` routing
+            parameter
+        num_local_experts (`int`, *optional*, defaults to 8):
+            Number of experts per Sparse MLP layer.
+        output_router_logits (`bool`, *optional*, defaults to `False`):
+            Whether or not the router logits should be returned by the model. Enabeling this will also
+            allow the model to output the auxiliary loss. See [here]() for more details
+        router_jitter_noise (`float`, *optional*, defaults to 0.0):
+            Amount of noise to add to the router.
     """
 
     model_type = "t5"
@@ -97,6 +109,12 @@ class T5Config(PretrainedConfig):
         pad_token_id=0,
         eos_token_id=1,
         classifier_dropout=0.0,
+        activate_moe=False,
+        num_experts_per_tok=2,
+        num_local_experts=8,
+        num_moe_layers=6,
+        output_router_logits=False,
+        router_jitter_noise=0.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -131,6 +149,13 @@ class T5Config(PretrainedConfig):
         # for backwards compatibility
         if feed_forward_proj == "gated-gelu":
             self.dense_act_fn = "gelu_new"
+        
+        self.activate_moe = activate_moe
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_local_experts = num_local_experts
+        self.num_moe_layers = num_moe_layers
+        self.output_router_logits = output_router_logits
+        self.router_jitter_noise = router_jitter_noise
 
         super().__init__(
             pad_token_id=pad_token_id,
